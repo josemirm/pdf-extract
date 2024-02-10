@@ -18,7 +18,7 @@ use std::fmt;
 use std::str;
 use std::fs::File;
 use std::slice::Iter;
-use std::collections::HashMap;
+use std::collections::{HashMap, BTreeMap};
 use std::collections::hash_map::Entry;
 use std::rc::Rc;
 use std::marker::PhantomData;
@@ -762,7 +762,7 @@ impl<'a> PdfFont for PdfSimpleFont<'a> {
         if let Some(ref unicode_map) = self.unicode_map {
             let s = unicode_map.get(&char);
             let s = match s {
-                None => { 
+                None => {
                     println!("missing char {:?} in unicode map {:?} for {:?}", char, unicode_map, self.font);
                     // some pdf's like http://arxiv.org/pdf/2312.00064v1 are missing entries in their unicode map but do have
                     // entries in the encoding.
@@ -2180,4 +2180,89 @@ pub fn output_doc(doc: &Document, output: &mut dyn OutputDev) -> Result<(), Outp
         output.end_page()?;
     }
     Ok(())
+}
+
+
+// Output just a page of the document
+fn output_page_doc(doc: &Document, pages: &BTreeMap<u32, lopdf::ObjectId>, output: &mut dyn OutputDev, page_number: u32) -> Result<(), OutputError> {
+    let empty_resources = &Dictionary::new();
+
+    let mut p = Processor::new();
+
+    // The page should start at 1, not 0
+    let page_id = pages[&page_number];
+
+
+    let page_dict = doc.get_object(page_id).unwrap().as_dict().unwrap();
+    dlog!("page {} {:?}", page_number, page_dict);
+    // XXX: Some pdfs lack a Resources directory
+    let resources = get_inherited(doc, page_dict, b"Resources").unwrap_or(empty_resources);
+    dlog!("resources {:?}", resources);
+
+    // pdfium searches up the page tree for MediaBoxes as needed
+    let media_box: Vec<f64> = get_inherited(doc, page_dict, b"MediaBox").expect("MediaBox");
+    let media_box = MediaBox { llx: media_box[0], lly: media_box[1], urx: media_box[2], ury: media_box[3] };
+
+    let art_box = get::<Option<Vec<f64>>>(&doc, page_dict, b"ArtBox")
+        .map(|x| (x[0], x[1], x[2], x[3]));
+
+    output.begin_page(page_number, &media_box, art_box)?;
+
+    p.process_stream(&doc, doc.get_page_content(page_id).unwrap(), resources,&media_box, output, page_number)?;
+
+    output.end_page()?;
+
+    Ok(())
+}
+
+
+pub struct PdfExtract {
+    doc: Document,
+    pages: BTreeMap<u32, lopdf::ObjectId>
+}
+
+impl PdfExtract {
+    pub fn open(path: &std::path::Path) -> PdfExtract {
+        let newdoc = Document::load(path).unwrap();
+
+        if let Ok(_) = newdoc.trailer.get(b"Encrypt") {
+            eprintln!("Encrypted documents are not currently supported: See https://github.com/J-F-Liu/lopdf/issues/168");
+            return PdfExtract {
+                doc: Document::new(),
+                pages: BTreeMap::new()
+            }
+        };
+
+        let newpages = newdoc.get_pages();
+
+        PdfExtract {
+            doc: newdoc,
+            pages: newpages
+        }
+    }
+
+    pub fn extract_text(&self) -> Result<String, OutputError> {
+        let mut s = String::new();
+        let mut output = PlainTextOutput::new(&mut s);
+        output_doc(&self.doc, &mut output)?;
+        return Ok(s);
+    }
+
+    pub fn extract_page_text(&self, page_number: u32) -> Result<String, OutputError> {
+        if page_number < 1 {
+            return Err(OutputError::PdfError(Error::PageNumberNotFound(0)));
+        }
+        let mut s = String::new();
+        let mut output = PlainTextOutput::new(&mut s);
+        output_page_doc(&self.doc, &self.pages, &mut output, page_number)?;
+
+        Ok(s)
+    }
+
+    // Maybe it could be more correct to call this function 'len', but it's
+    // more clear in this way
+    pub fn get_pages_count(&self) -> usize {
+        self.pages.len()
+    }
+
 }
